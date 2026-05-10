@@ -755,7 +755,7 @@ final class ProcessManager {
             }
 
             guard bounds.width >= 90, bounds.height >= 70 else { return nil }
-            guard let app = appsByPID[pid], app.activationPolicy == .regular else { return nil }
+            guard let app = appsByPID[pid], isUserWindowCandidate(app) else { return nil }
             guard app.bundleIdentifier != ownBundleIdentifier else { return nil }
 
             return DesktopWindow(
@@ -792,9 +792,13 @@ final class ProcessManager {
     }
 
     private func isUserHideCandidate(_ app: NSRunningApplication) -> Bool {
-        guard app.activationPolicy == .regular else { return false }
+        guard isUserWindowCandidate(app) else { return false }
         guard app.bundleIdentifier != ownBundleIdentifier else { return false }
         return true
+    }
+
+    private func isUserWindowCandidate(_ app: NSRunningApplication) -> Bool {
+        app.activationPolicy == .regular || app.activationPolicy == .accessory
     }
 }
 
