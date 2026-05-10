@@ -765,9 +765,10 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
     private let processManager: ProcessManager
     private let store: ProfileStore
     private var apps: [SavedApp] = []
-    private let tableView = NSTableView()
+    private let tableView = ContextSelectingTableView()
     private let countLabel = NSTextField(labelWithString: "")
     private let contentStack = FlippedStackView()
+    private var runningAppKeys = Set<String>()
     private var quittingAppKeys = Set<String>()
     private var quitRefreshTimer: Timer?
     private var quitRefreshDeadline: Date?
@@ -815,6 +816,7 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
 
     func reload() {
         apps = (try? processManager.loadProfile().apps) ?? []
+        refreshRunningAppKeys()
         tableView.reloadData()
         updateCount()
     }
@@ -1516,11 +1518,7 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
     }
 
     private func isRunning(_ savedApp: SavedApp) -> Bool {
-        NSWorkspace.shared.runningApplications.contains { running in
-            if let id = savedApp.bundleIdentifier, running.bundleIdentifier == id { return true }
-            if let path = savedApp.bundlePath, running.bundleURL?.path == path { return true }
-            return false
-        }
+        runningKeys(for: savedApp).contains { runningAppKeys.contains($0) }
     }
 
     private func runningStatus(for app: SavedApp) -> (title: String, color: NSColor) {
@@ -1554,6 +1552,7 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
     }
 
     private func refreshQuittingApps(timer: Timer? = nil) {
+        refreshRunningAppKeys()
         removeFinishedQuittingApps()
         tableView.reloadData()
         updateCount()
@@ -1583,6 +1582,7 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
         guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
             return
         }
+        refreshRunningAppKeys()
         if let bundleIdentifier = app.bundleIdentifier {
             quittingAppKeys.remove(bundleIdentifier)
         }
@@ -1590,6 +1590,16 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
             quittingAppKeys.remove(path)
         }
         refreshQuittingApps()
+    }
+
+    private func refreshRunningAppKeys() {
+        runningAppKeys = Set(NSWorkspace.shared.runningApplications.flatMap { app in
+            [app.bundleIdentifier, app.bundleURL?.path].compactMap(\.self)
+        })
+    }
+
+    private func runningKeys(for app: SavedApp) -> [String] {
+        [app.bundleIdentifier, app.bundlePath].compactMap(\.self)
     }
 
     private func perform(_ success: String, _ work: () throws -> Void) {
@@ -1626,6 +1636,17 @@ final class FlippedStackView: NSStackView {
 final class FlippedClipView: NSClipView {
     override var isFlipped: Bool {
         true
+    }
+}
+
+final class ContextSelectingTableView: NSTableView {
+    override func rightMouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let clickedRow = row(at: point)
+        if clickedRow >= 0, !selectedRowIndexes.contains(clickedRow) {
+            selectRowIndexes(IndexSet(integer: clickedRow), byExtendingSelection: false)
+        }
+        super.rightMouseDown(with: event)
     }
 }
 
