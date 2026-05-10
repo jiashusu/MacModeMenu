@@ -768,6 +768,9 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
     private let tableView = NSTableView()
     private let countLabel = NSTextField(labelWithString: "")
     private let contentStack = FlippedStackView()
+    private var quittingAppKeys = Set<String>()
+    private var quitRefreshTimer: Timer?
+    private var quitRefreshDeadline: Date?
     private var sidebarButtons: [Mode: NSButton] = [:]
     private var selectedMode: Mode = .display
     private let contentWidth: CGFloat = 820
@@ -796,6 +799,12 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
         window.minSize = NSSize(width: 1040, height: 680)
         super.init(window: window)
         window.center()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(runningApplicationTerminated(_:)),
+            name: NSWorkspace.didTerminateApplicationNotification,
+            object: nil
+        )
         buildInterface()
         reload()
     }
@@ -1288,8 +1297,9 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
 
         case "running":
             let cell = NSTableCellView()
-            let label = NSTextField(labelWithString: isRunning(app) ? "运行中" : "未运行")
-            label.textColor = isRunning(app) ? .systemGreen : .secondaryLabelColor
+            let status = runningStatus(for: app)
+            let label = NSTextField(labelWithString: status.title)
+            label.textColor = status.color
             label.font = .systemFont(ofSize: 13, weight: .semibold)
             label.lineBreakMode = .byTruncatingTail
             label.translatesAutoresizingMaskIntoConstraints = false
@@ -1361,8 +1371,10 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
 
     @objc private func quitSelectedApps() {
         let selected = selectedApps()
-        perform("已请求退出选中的App") { try processManager.quit(apps: selected) }
+        markQuitting(selected)
         tableView.reloadData()
+        perform("已请求退出选中的App") { try processManager.quit(apps: selected) }
+        startQuitRefresh()
     }
 
     @objc private func reopenSelectedApps() {
@@ -1420,10 +1432,12 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
 
     private func quit(row: Int) {
         guard row < apps.count else { return }
+        markQuitting([apps[row]])
+        tableView.reloadData()
         perform("已请求退出 \(apps[row].localizedName ?? "App")") {
             try processManager.quit(apps: [apps[row]])
         }
-        tableView.reloadData()
+        startQuitRefresh()
     }
 
     @objc private func saveLaptopProfile() {
@@ -1484,7 +1498,10 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
 
     private func updateCount() {
         let selected = tableView.selectedRowIndexes.count
-        countLabel.stringValue = selected > 0 ? "\(apps.count) 个，已选 \(selected) 个" : "\(apps.count) 个"
+        let quitting = apps.filter { quittingAppKeys.contains($0.identityKey) && isRunning($0) }.count
+        let selectedText = selected > 0 ? "，已选 \(selected) 个" : ""
+        let quittingText = quitting > 0 ? "，正在退出 \(quitting) 个" : ""
+        countLabel.stringValue = "\(apps.count) 个\(selectedText)\(quittingText)"
     }
 
     private func icon(for app: SavedApp) -> NSImage {
@@ -1504,6 +1521,75 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
             if let path = savedApp.bundlePath, running.bundleURL?.path == path { return true }
             return false
         }
+    }
+
+    private func runningStatus(for app: SavedApp) -> (title: String, color: NSColor) {
+        let running = isRunning(app)
+        if quittingAppKeys.contains(app.identityKey), running {
+            return ("正在退出", .systemOrange)
+        }
+        return running ? ("运行中", .systemGreen) : ("未运行", .secondaryLabelColor)
+    }
+
+    private func markQuitting(_ targetApps: [SavedApp]) {
+        let runningKeys = targetApps.filter(isRunning).map(\.identityKey)
+        quittingAppKeys.formUnion(runningKeys)
+        updateCount()
+    }
+
+    private func startQuitRefresh() {
+        quitRefreshDeadline = Date().addingTimeInterval(12)
+        quitRefreshTimer?.invalidate()
+        quitRefreshTimer = Timer.scheduledTimer(
+            timeInterval: 0.35,
+            target: self,
+            selector: #selector(refreshQuittingAppsFromTimer(_:)),
+            userInfo: nil,
+            repeats: true
+        )
+    }
+
+    @objc private func refreshQuittingAppsFromTimer(_ timer: Timer) {
+        refreshQuittingApps(timer: timer)
+    }
+
+    private func refreshQuittingApps(timer: Timer? = nil) {
+        removeFinishedQuittingApps()
+        tableView.reloadData()
+        updateCount()
+
+        let timedOut = quitRefreshDeadline.map { Date() >= $0 } ?? false
+        if quittingAppKeys.isEmpty || timedOut {
+            if timedOut {
+                quittingAppKeys.removeAll()
+            }
+            timer?.invalidate()
+            if timer === quitRefreshTimer {
+                quitRefreshTimer = nil
+                quitRefreshDeadline = nil
+            }
+            tableView.reloadData()
+            updateCount()
+        }
+    }
+
+    private func removeFinishedQuittingApps() {
+        quittingAppKeys = quittingAppKeys.filter { key in
+            apps.contains { $0.identityKey == key && isRunning($0) }
+        }
+    }
+
+    @objc private func runningApplicationTerminated(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+            return
+        }
+        if let bundleIdentifier = app.bundleIdentifier {
+            quittingAppKeys.remove(bundleIdentifier)
+        }
+        if let path = app.bundleURL?.path {
+            quittingAppKeys.remove(path)
+        }
+        refreshQuittingApps()
     }
 
     private func perform(_ success: String, _ work: () throws -> Void) {
