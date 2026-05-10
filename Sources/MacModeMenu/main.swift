@@ -844,7 +844,7 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
     private var quitRefreshTimer: Timer?
     private var quitRefreshDeadline: Date?
     private var desktopWindows: [DesktopWindow] = []
-    private let windowCollectionView = NSCollectionView()
+    private let windowCollectionView = ContextSelectingCollectionView()
     private let windowCountLabel = NSTextField(labelWithString: "")
     private var sidebarButtons: [Mode: NSButton] = [:]
     private var selectedMode: Mode = .display
@@ -1367,6 +1367,12 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
             DesktopWindowItem.self,
             forItemWithIdentifier: DesktopWindowItem.identifier
         )
+
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "定位选中", action: #selector(activateSelectedDesktopWindow), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "收起选中", action: #selector(hideSelectedDesktopWindows), keyEquivalent: ""))
+        menu.items.forEach { $0.target = self }
+        windowCollectionView.menu = menu
     }
 
     private func button(_ title: String, action: Selector) -> NSButton {
@@ -1845,6 +1851,17 @@ final class ContextSelectingTableView: NSTableView {
         let clickedRow = row(at: point)
         if clickedRow >= 0, !selectedRowIndexes.contains(clickedRow) {
             selectRowIndexes(IndexSet(integer: clickedRow), byExtendingSelection: false)
+        }
+        super.rightMouseDown(with: event)
+    }
+}
+
+final class ContextSelectingCollectionView: NSCollectionView {
+    override func rightMouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if let indexPath = indexPathForItem(at: point),
+           !selectionIndexPaths.contains(indexPath) {
+            selectionIndexPaths = [indexPath]
         }
         super.rightMouseDown(with: event)
     }
