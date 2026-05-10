@@ -631,6 +631,7 @@ final class DisplayManager {
     }
 }
 
+@MainActor
 final class ProcessManager {
     private let store: ProfileStore
     private let ownBundleIdentifier = Bundle.main.bundleIdentifier
@@ -707,15 +708,25 @@ final class ProcessManager {
     }
 
     func hideCurrentVisibleApps() throws {
-        for app in NSWorkspace.shared.runningApplications where isUserQuitCandidate(app) {
+        NSApplication.shared.hideOtherApplications(nil)
+
+        for app in NSWorkspace.shared.runningApplications where isUserHideCandidate(app) {
             app.hide()
         }
+
+        NSApplication.shared.hide(nil)
     }
 
     private func isUserQuitCandidate(_ app: NSRunningApplication) -> Bool {
         guard app.activationPolicy == .regular else { return false }
         guard app.bundleIdentifier != ownBundleIdentifier else { return false }
         guard app.bundleIdentifier != "com.apple.finder" else { return false }
+        return true
+    }
+
+    private func isUserHideCandidate(_ app: NSRunningApplication) -> Bool {
+        guard app.activationPolicy == .regular else { return false }
+        guard app.bundleIdentifier != ownBundleIdentifier else { return false }
         return true
     }
 }
