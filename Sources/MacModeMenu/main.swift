@@ -196,6 +196,20 @@ struct AppProfile: Codable {
     var apps: [SavedApp]
 }
 
+struct DesktopWindow: Hashable {
+    var id: UInt32
+    var ownerPID: pid_t
+    var ownerName: String
+    var title: String
+    var bounds: CGRect
+    var bundleIdentifier: String?
+    var bundlePath: String?
+
+    var displayTitle: String {
+        title.isEmpty ? ownerName : title
+    }
+}
+
 struct SavedApp: Codable, Hashable {
     var bundleIdentifier: String?
     var bundlePath: String?
@@ -717,6 +731,59 @@ final class ProcessManager {
         NSApplication.shared.hide(nil)
     }
 
+    func visibleDesktopWindows() -> [DesktopWindow] {
+        guard let infoList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+            as? [[String: Any]] else {
+            return []
+        }
+
+        let appsByPID = Dictionary(uniqueKeysWithValues: NSWorkspace.shared.runningApplications.map {
+            ($0.processIdentifier, $0)
+        })
+
+        return infoList.compactMap { info in
+            guard let id = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+                  let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                  let ownerName = info[kCGWindowOwnerName as String] as? String,
+                  let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue,
+                  layer == 0,
+                  let alpha = (info[kCGWindowAlpha as String] as? NSNumber)?.doubleValue,
+                  alpha > 0,
+                  let boundsInfo = info[kCGWindowBounds as String] as? NSDictionary,
+                  let bounds = CGRect(dictionaryRepresentation: boundsInfo) else {
+                return nil
+            }
+
+            guard bounds.width >= 90, bounds.height >= 70 else { return nil }
+            guard let app = appsByPID[pid], app.activationPolicy == .regular else { return nil }
+            guard app.bundleIdentifier != ownBundleIdentifier else { return nil }
+
+            return DesktopWindow(
+                id: id,
+                ownerPID: pid,
+                ownerName: app.localizedName ?? ownerName,
+                title: info[kCGWindowName as String] as? String ?? "",
+                bounds: bounds,
+                bundleIdentifier: app.bundleIdentifier,
+                bundlePath: app.bundleURL?.path
+            )
+        }
+    }
+
+    func hide(windows: [DesktopWindow]) throws {
+        let pids = Set(windows.map(\.ownerPID))
+        for app in NSWorkspace.shared.runningApplications
+            where pids.contains(app.processIdentifier) && isUserHideCandidate(app) {
+            app.hide()
+        }
+    }
+
+    func activate(window: DesktopWindow) {
+        NSWorkspace.shared.runningApplications
+            .first { $0.processIdentifier == window.ownerPID }?
+            .activate(options: [.activateAllWindows])
+    }
+
     private func isUserQuitCandidate(_ app: NSRunningApplication) -> Bool {
         guard app.activationPolicy == .regular else { return false }
         guard app.bundleIdentifier != ownBundleIdentifier else { return false }
@@ -738,7 +805,7 @@ private extension SavedApp {
 }
 
 @MainActor
-final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSCollectionViewDataSource, NSCollectionViewDelegate {
     private enum Mode: CaseIterable {
         case display
         case appExit
@@ -772,6 +839,9 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
     private var quittingAppKeys = Set<String>()
     private var quitRefreshTimer: Timer?
     private var quitRefreshDeadline: Date?
+    private var desktopWindows: [DesktopWindow] = []
+    private let windowCollectionView = NSCollectionView()
+    private let windowCountLabel = NSTextField(labelWithString: "")
     private var sidebarButtons: [Mode: NSButton] = [:]
     private var selectedMode: Mode = .display
     private let contentWidth: CGFloat = 820
@@ -842,6 +912,7 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
         root.addArrangedSubview(sidebar)
 
         configureTable()
+        configureWindowCollection()
 
         let scrollView = NSScrollView()
         scrollView.contentView = FlippedClipView(frame: .zero)
@@ -1084,6 +1155,7 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
 
     private func buildDesktopPage() {
         contentStack.addArrangedSubview(pageTitle("清空桌面模式", subtitle: "把当前所有普通 App 窗口收起来，进程继续运行，适合看电影或临时把桌面清爽下来。"))
+        refreshDesktopWindows()
 
         contentStack.addArrangedSubview(section("桌面窗口", rows: [
             serviceRow(
@@ -1101,6 +1173,29 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
                 ]
             )
         ]))
+
+        let toolbar = NSStackView()
+        toolbar.orientation = .horizontal
+        toolbar.spacing = 8
+
+        let title = NSTextField(labelWithString: "当前页面")
+        title.font = .systemFont(ofSize: 16, weight: .semibold)
+        toolbar.addArrangedSubview(title)
+        toolbar.addArrangedSubview(windowCountLabel)
+        toolbar.addArrangedSubview(NSView())
+        toolbar.addArrangedSubview(button("刷新", action: #selector(refreshDesktopWindowList)))
+        toolbar.addArrangedSubview(button("定位选中", action: #selector(activateSelectedDesktopWindow)))
+        toolbar.addArrangedSubview(button("收起选中", action: #selector(hideSelectedDesktopWindows)))
+        setContentWidth(toolbar)
+        contentStack.addArrangedSubview(toolbar)
+
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.drawsBackground = false
+        scrollView.documentView = windowCollectionView
+        scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 340).isActive = true
+        setContentWidth(scrollView)
+        contentStack.addArrangedSubview(scrollView)
     }
 
     private func pageTitle(_ title: String, subtitle: String) -> NSView {
@@ -1251,6 +1346,25 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
         tableView.menu = menu
     }
 
+    private func configureWindowCollection() {
+        let layout = NSCollectionViewFlowLayout()
+        layout.itemSize = NSSize(width: 188, height: 148)
+        layout.minimumInteritemSpacing = 12
+        layout.minimumLineSpacing = 12
+        layout.sectionInset = NSEdgeInsets(top: 2, left: 2, bottom: 14, right: 2)
+
+        windowCollectionView.collectionViewLayout = layout
+        windowCollectionView.isSelectable = true
+        windowCollectionView.allowsMultipleSelection = true
+        windowCollectionView.dataSource = self
+        windowCollectionView.delegate = self
+        windowCollectionView.backgroundColors = [.clear]
+        windowCollectionView.register(
+            DesktopWindowItem.self,
+            forItemWithIdentifier: DesktopWindowItem.identifier
+        )
+    }
+
     private func button(_ title: String, action: Selector) -> NSButton {
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .rounded
@@ -1320,6 +1434,40 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
 
     func tableViewSelectionDidChange(_ notification: Notification) {
         updateCount()
+    }
+
+    func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int {
+        desktopWindows.count
+    }
+
+    func collectionView(
+        _ collectionView: NSCollectionView,
+        itemForRepresentedObjectAt indexPath: IndexPath
+    ) -> NSCollectionViewItem {
+        let item = collectionView.makeItem(
+            withIdentifier: DesktopWindowItem.identifier,
+            for: indexPath
+        )
+        guard let windowItem = item as? DesktopWindowItem,
+              indexPath.item < desktopWindows.count else {
+            return item
+        }
+        windowItem.configure(with: desktopWindows[indexPath.item], icon: icon(for: desktopWindows[indexPath.item]))
+        return windowItem
+    }
+
+    func collectionView(
+        _ collectionView: NSCollectionView,
+        didSelectItemsAt indexPaths: Set<IndexPath>
+    ) {
+        updateDesktopWindowCount()
+    }
+
+    func collectionView(
+        _ collectionView: NSCollectionView,
+        didDeselectItemsAt indexPaths: Set<IndexPath>
+    ) {
+        updateDesktopWindowCount()
     }
 
     func tableView(
@@ -1407,6 +1555,25 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
             try processManager.hideCurrentVisibleApps()
         }
         tableView.reloadData()
+        refreshDesktopWindows()
+    }
+
+    @objc private func refreshDesktopWindowList() {
+        refreshDesktopWindows()
+    }
+
+    @objc private func hideSelectedDesktopWindows() {
+        let selected = selectedDesktopWindows()
+        guard !selected.isEmpty else { return }
+        perform("已收起选中的页面") {
+            try processManager.hide(windows: selected)
+        }
+        refreshDesktopWindows()
+    }
+
+    @objc private func activateSelectedDesktopWindow() {
+        guard let window = selectedDesktopWindows().first else { return }
+        processManager.activate(window: window)
     }
 
     private func remove(row: Int) {
@@ -1494,6 +1661,24 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
         }
     }
 
+    private func selectedDesktopWindows() -> [DesktopWindow] {
+        windowCollectionView.selectionIndexPaths.compactMap { indexPath in
+            guard indexPath.item < desktopWindows.count else { return nil }
+            return desktopWindows[indexPath.item]
+        }
+    }
+
+    private func refreshDesktopWindows() {
+        desktopWindows = processManager.visibleDesktopWindows()
+        windowCollectionView.reloadData()
+        updateDesktopWindowCount()
+    }
+
+    private func updateDesktopWindowCount() {
+        let selected = windowCollectionView.selectionIndexPaths.count
+        windowCountLabel.stringValue = selected > 0 ? "\(desktopWindows.count) 个，已选 \(selected) 个" : "\(desktopWindows.count) 个"
+    }
+
     private func persistApps() {
         try? processManager.saveProfile(AppProfile(apps: apps))
     }
@@ -1512,6 +1697,17 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
             return NSWorkspace.shared.icon(forFile: url.path)
         }
         if let bundlePath = app.bundlePath {
+            return NSWorkspace.shared.icon(forFile: bundlePath)
+        }
+        return NSWorkspace.shared.icon(for: .application)
+    }
+
+    private func icon(for window: DesktopWindow) -> NSImage {
+        if let bundleIdentifier = window.bundleIdentifier,
+           let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) {
+            return NSWorkspace.shared.icon(forFile: url.path)
+        }
+        if let bundlePath = window.bundlePath {
             return NSWorkspace.shared.icon(forFile: bundlePath)
         }
         return NSWorkspace.shared.icon(for: .application)
@@ -1647,6 +1843,125 @@ final class ContextSelectingTableView: NSTableView {
             selectRowIndexes(IndexSet(integer: clickedRow), byExtendingSelection: false)
         }
         super.rightMouseDown(with: event)
+    }
+}
+
+final class DesktopWindowItem: NSCollectionViewItem {
+    static let identifier = NSUserInterfaceItemIdentifier("DesktopWindowItem")
+
+    private let previewView = NSView()
+    private let previewImageView = NSImageView()
+    private let iconView = NSImageView()
+    private let titleLabel = NSTextField(labelWithString: "")
+    private let appLabel = NSTextField(labelWithString: "")
+    private let sizeLabel = NSTextField(labelWithString: "")
+
+    override var isSelected: Bool {
+        didSet {
+            updateSelectionStyle()
+        }
+    }
+
+    override func loadView() {
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 188, height: 148))
+        view.wantsLayer = true
+        view.layer?.cornerRadius = 7
+        view.layer?.borderWidth = 1
+
+        previewView.wantsLayer = true
+        previewView.layer?.cornerRadius = 5
+        previewView.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.22).cgColor
+        previewView.layer?.borderWidth = 1
+        previewView.layer?.borderColor = NSColor.white.withAlphaComponent(0.06).cgColor
+        previewView.translatesAutoresizingMaskIntoConstraints = false
+
+        previewImageView.imageScaling = .scaleProportionallyUpOrDown
+        previewImageView.translatesAutoresizingMaskIntoConstraints = false
+
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+
+        titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        appLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        appLabel.textColor = .secondaryLabelColor
+        appLabel.lineBreakMode = .byTruncatingTail
+        appLabel.maximumNumberOfLines = 1
+        appLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        sizeLabel.font = .systemFont(ofSize: 10, weight: .medium)
+        sizeLabel.textColor = NSColor.white.withAlphaComponent(0.48)
+        sizeLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        view.addSubview(previewView)
+        previewView.addSubview(previewImageView)
+        view.addSubview(iconView)
+        view.addSubview(titleLabel)
+        view.addSubview(appLabel)
+        view.addSubview(sizeLabel)
+
+        NSLayoutConstraint.activate([
+            previewView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
+            previewView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
+            previewView.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
+            previewView.heightAnchor.constraint(equalToConstant: 72),
+
+            previewImageView.leadingAnchor.constraint(equalTo: previewView.leadingAnchor, constant: 4),
+            previewImageView.trailingAnchor.constraint(equalTo: previewView.trailingAnchor, constant: -4),
+            previewImageView.topAnchor.constraint(equalTo: previewView.topAnchor, constant: 4),
+            previewImageView.bottomAnchor.constraint(equalTo: previewView.bottomAnchor, constant: -4),
+
+            iconView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            iconView.topAnchor.constraint(equalTo: previewView.bottomAnchor, constant: 9),
+            iconView.widthAnchor.constraint(equalToConstant: 24),
+            iconView.heightAnchor.constraint(equalToConstant: 24),
+
+            titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+            titleLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
+            titleLabel.topAnchor.constraint(equalTo: previewView.bottomAnchor, constant: 7),
+
+            appLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            appLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+            appLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+
+            sizeLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
+            sizeLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
+            sizeLabel.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -8)
+        ])
+
+        updateSelectionStyle()
+    }
+
+    func configure(with window: DesktopWindow, icon: NSImage) {
+        iconView.image = icon
+        previewImageView.image = thumbnail(for: window)
+        titleLabel.stringValue = window.displayTitle
+        appLabel.stringValue = window.ownerName
+        sizeLabel.stringValue = "\(Int(window.bounds.width)) x \(Int(window.bounds.height))"
+    }
+
+    private func thumbnail(for window: DesktopWindow) -> NSImage? {
+        guard let image = CGWindowListCreateImage(
+            .null,
+            .optionIncludingWindow,
+            CGWindowID(window.id),
+            [.boundsIgnoreFraming, .bestResolution]
+        ) else {
+            return nil
+        }
+        return NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+    }
+
+    private func updateSelectionStyle() {
+        view.layer?.backgroundColor = isSelected
+            ? NSColor.controlAccentColor.withAlphaComponent(0.34).cgColor
+            : NSColor(red: 0.170, green: 0.170, blue: 0.175, alpha: 1).cgColor
+        view.layer?.borderColor = isSelected
+            ? NSColor.controlAccentColor.cgColor
+            : NSColor.white.withAlphaComponent(0.07).cgColor
     }
 }
 
