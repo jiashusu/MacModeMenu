@@ -1565,7 +1565,7 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
             try processManager.hideCurrentVisibleApps()
         }
         tableView.reloadData()
-        refreshDesktopWindows()
+        refreshDesktopWindowsAfterOperation()
     }
 
     @objc private func refreshDesktopWindowList() {
@@ -1578,12 +1578,13 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
         perform("已收起选中的页面") {
             try processManager.hide(windows: selected)
         }
-        refreshDesktopWindows()
+        refreshDesktopWindowsAfterOperation()
     }
 
     @objc private func activateSelectedDesktopWindow() {
         guard let window = selectedDesktopWindows().first else { return }
         processManager.activate(window: window)
+        refreshDesktopWindowsAfterOperation()
     }
 
     private func remove(row: Int) {
@@ -1662,6 +1663,7 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
     @objc private func showCurrentWindow() {
         showWindow(nil)
         NSApplication.shared.activate(ignoringOtherApps: true)
+        refreshDesktopWindowsAfterOperation()
     }
 
     private func selectedApps() -> [SavedApp] {
@@ -1682,6 +1684,13 @@ final class AppWindowController: NSWindowController, NSTableViewDataSource, NSTa
         desktopWindows = processManager.visibleDesktopWindows()
         windowCollectionView.reloadData()
         updateDesktopWindowCount()
+    }
+
+    private func refreshDesktopWindowsAfterOperation() {
+        refreshDesktopWindows()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.refreshDesktopWindows()
+        }
     }
 
     private func updateDesktopWindowCount() {
