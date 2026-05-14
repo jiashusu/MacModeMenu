@@ -40,22 +40,12 @@ final class MacModeMenuApp: NSObject, NSApplicationDelegate {
         menu.addItem(action("切到4K显示器模式", #selector(switchToMonitorMode)))
         menu.addItem(action("镜像模式", #selector(switchToMirrorMode)))
         menu.addItem(action("扩展模式", #selector(switchToExtendedMode)))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(action("保存当前为笔记本模式", #selector(saveLaptopProfile)))
-        menu.addItem(action("保存当前为4K显示器模式", #selector(saveMonitorProfile)))
 
         menu.addItem(NSMenuItem.separator())
         menu.addItem(disabled("进程"))
         menu.addItem(action("打开管理窗口", #selector(showMainWindow)))
         menu.addItem(action("一键收起所有窗口", #selector(hideCurrentVisibleApps)))
-        menu.addItem(action("记录当前运行的App", #selector(saveAppProfile)))
-        menu.addItem(action("退出已记录的App", #selector(quitSavedApps)))
-        menu.addItem(action("重新打开已记录的App", #selector(reopenSavedApps)))
-        menu.addItem(action("退出当前普通App", #selector(quitCurrentVisibleApps)))
 
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(action("打开配置文件夹", #selector(openConfigFolder)))
-        menu.addItem(action("刷新菜单", #selector(refreshMenu)))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(action("退出 Mac模式", #selector(quit)))
 
@@ -303,7 +293,7 @@ final class DisplayManager {
     }
 
     func switchToLaptopMode() throws {
-        guard let builtin = activeDisplays().first(where: { CGDisplayIsBuiltin($0) != 0 }) else {
+        guard let builtin = onlineDisplays().first(where: { CGDisplayIsBuiltin($0) != 0 }) else {
             throw AppError("没有找到内置显示屏。")
         }
         try savePreferredDisplayTarget(.builtin)
@@ -314,8 +304,20 @@ final class DisplayManager {
     }
 
     func switchToMonitorMode() throws {
+        let shouldRemainMirrored = isMirroring()
         try savePreferredDisplayTarget(.external)
-        try unmirrorAllDisplays()
+
+        if shouldRemainMirrored {
+            guard let external = preferredExternalDisplay() else {
+                throw AppError("没有找到外接显示器。")
+            }
+            try unmirrorAllDisplays()
+            try applyDefaultModeIfAvailable(for: external)
+            try makeMainDisplayIfPossible(external)
+            try mirrorAllDisplays(to: external)
+            return
+        }
+
         for display in activeDisplays() where CGDisplayIsBuiltin(display) == 0 {
             try applyDefaultModeIfAvailable(for: display)
         }
@@ -498,7 +500,7 @@ final class DisplayManager {
     private func preferredMainDisplay() -> CGDirectDisplayID? {
         switch preferredDisplayTarget() {
         case .builtin:
-            return activeDisplays().first(where: { CGDisplayIsBuiltin($0) != 0 }) ?? activeDisplays().first
+            return onlineDisplays().first(where: { CGDisplayIsBuiltin($0) != 0 }) ?? activeDisplays().first
         case .external:
             return preferredExternalDisplay() ?? activeDisplays().first
         }
@@ -509,7 +511,7 @@ final class DisplayManager {
     }
 
     private func preferredExternalDisplay() -> CGDirectDisplayID? {
-        activeDisplays().first(where: { CGDisplayIsBuiltin($0) == 0 })
+        onlineDisplays().first(where: { CGDisplayIsBuiltin($0) == 0 })
     }
 
     private func makeMainDisplay(_ main: CGDirectDisplayID) throws {
